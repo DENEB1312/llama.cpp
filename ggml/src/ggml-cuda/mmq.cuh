@@ -698,70 +698,50 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
     const int kbx  = txi / QI8_0;
     const int kqsx = txi % QI8_0;
-    
-    // loop size and qs vectors for caching
-    constexpr int iters = mmq_y / (nrows * nwarps);
-    int qs_tmp0[iters];
-    int qs_tmp1[iters];
 
-    //Pointer and offset precomputed outside loop (its the same as doing it inside)
-    const int i_off = (nrows == 1 ? threadIdx.y : threadIdx.y * nrows + threadIdx.x / threads_per_row);
-    const block_q8_0 * bx_base = (const block_q8_0 *)x + kbx0 + kbx;
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
-    //loading loop from VRAM --> registers   
-    #pragma unroll
-    for (int i0 = 0; i0 < iters; i0++) {
-        // double counters: i_slot is never clamped to i_max, so i can write on all the slots. i_read is clamped to the i_max, to avoid oob data.
-        const int i_slot = i0 * nrows * nwarps + i_off; 
-        const int i_read = need_check ? min(i_slot, i_max) : i_slot;
-        // fancy mask: -int(true) = -1 is hex 0xFFFFFFFF, while -int(false) = 0x00000000
-        const int mask = need_check ? -(int)(i_slot <= i_max) : -1;  
-        //like upstream, with i_read
-        const block_q8_0 * bxi = bx_base + i_read * stride;
-        //temporary registers to hold the qs, masked
-        qs_tmp0[i0] = get_int_b2(bxi[0].qs,                    kqsx) & mask;
-        qs_tmp1[i0] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs,  kqsx) & mask;
-    }
-    
-    //storing loop registers --> LDS, like upstream, with i_slot
-    #pragma unroll
-    for (int i0 = 0; i0 < iters; i0++) {
-        const int i_slot = i0 * nrows * nwarps + i_off;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbx;
+
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i_slot*MMQ_MMA_TILE_X_K_Q8_0 + 0             + txi] = qs_tmp0[i0];
-        x_qs[i_slot*MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K + txi] = qs_tmp1[i0];
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
+        x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
 #else
-        x_qs[i_slot*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = qs_tmp0[i0];
-        x_qs[i_slot*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = qs_tmp1[i0];
+#pragma unroll
+        for (int k = 0; k < 2*MMQ_TILE_NE_K; k += threads_per_row) {
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k + txi] = get_int_b2(bxi[k/QI8_0].qs, kqsx);
+        }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
-    //like upstream
     constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
     constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
     const int kbxd = threadIdx.x % blocks_per_tile_x_row;
 
-    //Pointer and offset precomputed outside loop (its the same as doing it inside)
-    const int i_off_d = threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
-    const block_q8_0 * bx_d_base = (const block_q8_0 *)x + kbx0 + kbxd;
-
-    //scale loading loop VRAM --> LDS, like upstream
-    #pragma unroll
+#pragma unroll
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps * rows_per_warp) {
-        const int i_slot = i0 + i_off_d;
-        const int i_read = need_check ? min(i_slot, i_max) : i_slot;
-        //like upstream, with i_read
-        const block_q8_0 * bxi = bx_d_base + i_read * stride;
-        //mask
-        const float d_val = (need_check && i_slot > i_max) ? 0.0f : (float)bxi->d;
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbxd;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i_slot*MMQ_MMA_TILE_X_K_Q8_0                 + kbxd] = d_val;
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0                 + kbxd] = bxi->d;
 #else
-        x_df[i_slot*(2*MMQ_TILE_NE_K/QI8_0) + i_slot/(QI8_0/2) + kbxd] = d_val;
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + kbxd] = bxi->d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
+
 
 template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
